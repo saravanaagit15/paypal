@@ -1,0 +1,225 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  fullName     String
+  passwordHash String
+  avatarUrl    String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  budget              Budget?
+  spendingPolicy      SpendingPolicy?
+  merchantWhitelist   MerchantWhitelist[]
+  merchantBlacklist   MerchantBlacklist[]
+  transactions        Transaction[]
+  approvals           TransactionApproval[]
+  budgetReservations  BudgetReservation[]
+  agentSessions       AgentSession[]
+  auditLogs           AuditLog[]
+  notifications       Notification[]
+  integrations        Integration[]
+}
+
+model Budget {
+  id                  String   @id @default(cuid())
+  userId              String   @unique
+  monthlyLimit        Float    @default(200.0)
+  currentMonthlySpent Float    @default(0.0)
+  singleTxLimit       Float    @default(25.0)
+  dailyLimit          Float    @default(50.0)
+  weeklyLimit         Float    @default(100.0)
+  emergencyFreeze     Boolean  @default(false)
+  currency            String   @default("USD")
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model SpendingPolicy {
+  id                         String   @id @default(cuid())
+  userId                     String   @unique
+  requireApprovalAbove       Float    @default(25.0)
+  blockUnapprovedCategories  Boolean  @default(true)
+  blockNonWhitelistedMerchants Boolean @default(false)
+  whitelistedCategoriesJson  String   @default("[\"developer tools\",\"github dependencies\",\"cloud hosting\",\"api credits\",\"open-source tipping\",\"infrastructure\",\"saas subscription\"]")
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model MerchantWhitelist {
+  id           String   @id @default(cuid())
+  userId       String
+  merchantName String
+  domain       String?
+  category     String?
+  notes        String?
+  createdAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model MerchantBlacklist {
+  id           String   @id @default(cuid())
+  userId       String
+  merchantName String
+  domain       String?
+  reason       String?
+  createdAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Transaction {
+  id                  String   @id @default(cuid())
+  userId              String
+  orderId             String?  @unique
+  captureId           String?
+  payoutBatchId       String?
+  type                String   // "ORDER_CAPTURE" | "PAYOUT" | "DIRECT_CHECKOUT"
+  amount              Float
+  currency            String   @default("USD")
+  recipient           String
+  category            String
+  description         String
+  status              String   @default("PENDING_APPROVAL") // "COMPLETED" | "PENDING_APPROVAL" | "BLOCKED_BY_GUARDRAIL" | "FAILED" | "REJECTED"
+  requiresApproval    Boolean  @default(false)
+  autoCaptured        Boolean  @default(false)
+  guardrailEvaluated  Boolean  @default(true)
+  riskScore           Float    @default(0.0)
+  rawResponseJson     String?  // JSON string
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  approvals           TransactionApproval[]
+  reservations        BudgetReservation[]
+
+  @@index([userId, status])
+  @@index([createdAt])
+}
+
+model TransactionApproval {
+  id            String    @id @default(cuid())
+  transactionId String
+  userId        String
+  status        String    @default("PENDING") // "PENDING" | "APPROVED" | "REJECTED" | "EXPIRED"
+  reason        String?
+  expiresAt     DateTime?
+  approvedAt    DateTime?
+  rejectedAt    DateTime?
+  createdAt     DateTime  @default(now())
+
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status])
+  @@index([transactionId])
+}
+
+model BudgetReservation {
+  id            String    @id @default(cuid())
+  transactionId String?
+  userId        String
+  amount        Float
+  status        String    @default("ACTIVE") // "ACTIVE" | "COMMITTED" | "RELEASED"
+  expiresAt     DateTime
+  createdAt     DateTime  @default(now())
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transaction Transaction? @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+
+  @@index([userId, status])
+}
+
+model AgentSession {
+  id        String      @id @default(cuid())
+  userId    String
+  title     String      @default("New Commerce Session")
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  user  User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tasks AgentTask[]
+
+  @@index([userId])
+}
+
+model AgentTask {
+  id         String   @id @default(cuid())
+  sessionId  String
+  prompt     String
+  intent     String?
+  status     String   @default("COMPLETED")
+  planJson   String?
+  resultJson String?
+  createdAt  DateTime @default(now())
+
+  session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+}
+
+model AuditLog {
+  id           String   @id @default(cuid())
+  userId       String
+  action       String   // e.g., "USER_LOGIN", "PAYPAL_ORDER_CREATED", "GUARDRAIL_BLOCKED", "APPROVAL_GRANTED"
+  entityType   String   // "TRANSACTION", "BUDGET", "POLICY", "AUTH", "PAYPAL"
+  entityId     String?
+  detail       String
+  ipAddress    String?
+  userAgent    String?
+  metadataJson String?
+  createdAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, action])
+  @@index([createdAt])
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  type      String   // "APPROVAL_REQUIRED", "TX_COMPLETED", "POLICY_BLOCKED", "BUDGET_WARNING"
+  title     String
+  message   String
+  read      Boolean  @default(false)
+  link      String?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, read])
+  @@index([createdAt])
+}
+
+model Integration {
+  id            String    @id @default(cuid())
+  userId        String
+  provider      String    // "PAYPAL_SANDBOX", "OPENAI", "DATABASE"
+  status        String    @default("CONNECTED") // "CONNECTED", "DISCONNECTED", "ERROR"
+  configJson    String?
+  lastCheckedAt DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, provider])
+}

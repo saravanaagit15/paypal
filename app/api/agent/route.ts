@@ -1,16 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server';
 import OpenAI from 'openai';
-import { verifyBudgetGuardrails, getGuardrailConfig, recordGuardrailSpend } from '@/lib/guardrails';
+import { prisma } from '@/lib/db';
+import { getSessionUser } from '@/lib/auth';
+import { evaluateTransactionGovernance, commitBudgetReservation } from '@/lib/governance';
 import { createPayPalOrder, capturePayPalOrder, createPayPalPayout } from '@/lib/paypal';
-import { addLedgerEntry } from '@/lib/ledger';
+import { addDbTransaction } from '@/lib/ledger';
 import { AgentChainOfThoughtStep, AgentArtifact } from '@/lib/types';
 
 const SYSTEM_PROMPT = `You are TrustAgent, an autonomous financial intelligence agent executing commerce actions on PayPal Sandbox. You strictly adhere to user financial guardrails:
 
-Default single transaction ceiling: $25.00
-Default monthly ceiling: $200.00
-Whitelisted domains/categories: Developer tools, GitHub dependencies, cloud hosting, API credits, open-source tipping.
-Never authorize or execute any payment that violates these bounds without triggering a Human-in-the-Loop approval prompt.
+- Default single transaction ceiling: $25.00
+- Default monthly ceiling: $200.00
+- Whitelisted domains/categories: Developer tools, GitHub dependencies, cloud hosting, API credits, open-source tipping.
+- Never authorize or execute any payment that violates these bounds without triggering a Human-in-the-Loop approval prompt.
 
 When a user requests a payment, subscription, tip, or purchase:
 1. First evaluate and verify budget guardrails.
@@ -27,7 +29,7 @@ const AGENT_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
         type: 'object',
         properties: {
           amount: { type: 'number', description: 'Amount in USD to check' },
-          category: { type: 'string', description: 'Transaction category (e.g. developer tools, cloud hosting, etc.)' },
+          category: { type: 'string', description: 'Transaction category' },
         },
         required: ['amount', 'category'],
       },
@@ -67,46 +69,75 @@ const AGENT_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'get_remaining_budget',
+      description: 'Fetches the user current remaining monthly budget envelope.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_transaction_history',
+      description: 'Retrieves recent transactions from the user ledger.',
+      parameters: {
+        type: 'object',
+        properties: { limit: { type: 'number', description: 'Number of transactions to return' } },
+      },
+    },
+  },
 ];
 
-// Fallback Autonomous Agent Engine for Demo Mode / Missing API Keys
-async function runSimulatedAgent(prompt: string): Promise<{
+async function runAutonomousCommerceChain(params: {
+  userId: string;
+  prompt: string;
+}): Promise<{
   content: string;
   steps: AgentChainOfThoughtStep[];
   artifact?: AgentArtifact;
 }> {
+  const { userId, prompt } = params;
   const steps: AgentChainOfThoughtStep[] = [];
   const lower = prompt.toLowerCase();
-  const guardrails = getGuardrailConfig();
 
-  // Extract amount if present
+  // 1. Fetch user budget & policies
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    include: { budget: true, spendingPolicy: true },
+  });
+
+  const singleCeiling = user?.spendingPolicy?.requireApprovalAbove || user?.budget?.singleTxLimit || 25.0;
+
+  // Extract amount
   const amountMatch = prompt.match(/\$?\s*([0-9]+(?:\.[0-9]{1,2})?)/);
-  let amount = amountMatch ? parseFloat(amountMatch[1]) : 15.00;
+  const amount = amountMatch ? parseFloat(amountMatch[1]) : 15.0;
 
   // Determine intent & category
   let isPayout = lower.includes('tip') || lower.includes('payout') || lower.includes('disburse') || lower.includes('@');
-  let category = 'Developer tools';
+  let category = 'developer tools';
   let recipient = 'Vendor / Service';
   let memo = prompt;
 
   if (lower.includes('aws') || lower.includes('cloud') || lower.includes('hosting') || lower.includes('database')) {
-    category = 'Cloud hosting';
+    category = 'cloud hosting';
     recipient = 'AWS Cloud Infrastructure';
   } else if (lower.includes('vercel') || lower.includes('next.js') || lower.includes('edge')) {
-    category = 'Cloud hosting';
+    category = 'cloud hosting';
     recipient = 'Vercel Inc.';
   } else if (lower.includes('github') || lower.includes('copilot') || lower.includes('npm')) {
-    category = 'Developer tools';
+    category = 'developer tools';
     recipient = 'GitHub / npm';
   } else if (lower.includes('openai') || lower.includes('anthropic') || lower.includes('api credit')) {
-    category = 'API credits';
+    category = 'api credits';
     recipient = 'AI Gateway Provider';
   } else if (lower.includes('tailwind') || lower.includes('maintainer') || lower.includes('oss') || isPayout) {
-    category = 'Open-source tipping';
+    category = 'open-source tipping';
     recipient = lower.includes('@') ? (lower.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/)?.[0] || 'maintainer@oss.org') : 'maintainer@tailwindcss.com';
     isPayout = true;
   } else if (lower.includes('casino') || lower.includes('gambling') || lower.includes('bet')) {
-    category = 'Gambling';
+    category = 'gambling';
     recipient = 'VIP Casino';
   }
 
@@ -123,28 +154,47 @@ async function runSimulatedAgent(prompt: string): Promise<{
   steps.push({
     type: 'tool_call',
     title: 'Tool Call: verify_budget_guardrails',
-    detail: `Invoking verify_budget_guardrails({ amount: ${amount}, category: "${category}" })`,
+    detail: `Invoking deterministic governance engine for $${amount.toFixed(2)} [Category: ${category}]`,
     timestamp: new Date().toISOString(),
     status: 'pending',
   });
 
-  const guardrailCheck = verifyBudgetGuardrails(amount, category);
-
-  // Step 3: Parameter Evaluation & Guardrail Check
-  steps.push({
-    type: 'guardrail_check',
-    title: 'Guardrail Policy Assessment',
-    detail: guardrailCheck.reason || 'Guardrail evaluated',
-    timestamp: new Date().toISOString(),
-    status: !guardrailCheck.allowed ? 'error' : (guardrailCheck.requiresHumanApproval ? 'warning' : 'success'),
-    data: guardrailCheck,
+  // Server-side deterministic policy verification
+  const governance = await evaluateTransactionGovernance({
+    userId,
+    amount,
+    recipient,
+    category,
+    description: memo,
   });
 
-  // Handle policy violation / unauthorized category
-  if (!guardrailCheck.allowed) {
-    const errorMsg = `Transaction rejected by TrustAgent policy: ${guardrailCheck.reason} Category "${category}" is not whitelisted.`;
+  steps.push({
+    type: 'guardrail_check',
+    title: 'Financial Governance Policy Evaluation',
+    detail: governance.reason,
+    timestamp: new Date().toISOString(),
+    status: !governance.allowed ? 'error' : governance.requiresHumanApproval ? 'warning' : 'success',
+    data: governance,
+  });
+
+  // If hard policy rejection
+  if (!governance.allowed) {
+    await addDbTransaction({
+      userId,
+      type: isPayout ? 'PAYOUT' : 'ORDER_CAPTURE',
+      amount,
+      recipient,
+      category,
+      description: memo,
+      status: 'BLOCKED_BY_GUARDRAIL',
+      requiresApproval: true,
+      autoCaptured: false,
+      riskScore: governance.riskScore,
+      rawResponse: { reason: governance.reason, violations: governance.violations },
+    });
+
     return {
-      content: `I cannot proceed with this transaction. ${guardrailCheck.reason}\n\nOur financial guardrails restrict autonomous disbursements to whitelisted developer and infrastructure categories. Please update your budget policy in settings if you wish to allow this category.`,
+      content: `I cannot proceed with this transaction. ${governance.reason}\n\nOur financial guardrails restrict autonomous disbursements to whitelisted developer and infrastructure categories. Please update your budget policy in settings if you wish to allow this vendor.`,
       steps,
       artifact: {
         id: `art_block_${Date.now()}`,
@@ -156,15 +206,15 @@ async function runSimulatedAgent(prompt: string): Promise<{
           recipient,
           amount,
           category,
-          violations: guardrailCheck.violations,
-          ceiling: guardrails.singleTxLimit,
-          remainingBudget: guardrailCheck.remainingMonthlyBudget,
+          violations: governance.violations,
+          ceiling: singleCeiling,
+          remainingBudget: governance.remainingMonthlyBudget,
         },
       },
     };
   }
 
-  // Handle Payout flow
+  // Handle Payout Flow
   if (isPayout) {
     steps.push({
       type: 'api_invocation',
@@ -180,22 +230,23 @@ async function runSimulatedAgent(prompt: string): Promise<{
       note: memo,
     });
 
-    recordGuardrailSpend(amount);
-
-    addLedgerEntry({
+    const tx = await addDbTransaction({
+      userId,
       type: 'PAYOUT',
       amount,
-      currency: 'USD',
       recipient: recipient.includes('@') ? recipient : 'developer@ecosystem.org',
       category,
       description: memo,
       status: 'COMPLETED',
-      paypalPayoutBatchId: payoutResult.batch_header?.payout_batch_id || `BATCH-${Date.now()}`,
-      guardrailEvaluated: true,
-      autoCaptured: true,
+      payoutBatchId: payoutResult.batch_header?.payout_batch_id || `BATCH-${Date.now()}`,
       requiresApproval: false,
+      autoCaptured: true,
       rawResponse: payoutResult,
     });
+
+    if (governance.reservationId && tx) {
+      await commitBudgetReservation(governance.reservationId, userId, tx.id);
+    }
 
     steps.push({
       type: 'api_invocation',
@@ -207,7 +258,7 @@ async function runSimulatedAgent(prompt: string): Promise<{
     });
 
     return {
-      content: `Successfully disbursed an autonomous PayPal Payout of $${amount.toFixed(2)} to ${recipient}. This transaction was verified within your $${guardrails.singleTxLimit.toFixed(2)} single ceiling and updated in your ledger.`,
+      content: `Successfully disbursed an autonomous PayPal Payout of $${amount.toFixed(2)} to ${recipient}. This transaction was verified within your $${singleCeiling.toFixed(2)} single ceiling and updated in your persistent ledger.`,
       steps,
       artifact: {
         id: `art_payout_${Date.now()}`,
@@ -243,36 +294,35 @@ async function runSimulatedAgent(prompt: string): Promise<{
     category,
   });
 
-  const requiresApproval = guardrailCheck.requiresHumanApproval;
+  const requiresApproval = governance.requiresHumanApproval;
 
   if (requiresApproval) {
-    // Exceeds single transaction limit: Flag REQUIRES_HUMAN_APPROVAL and slide open Artifact drawer
-    const ledgerEntry = addLedgerEntry({
+    const tx = await addDbTransaction({
+      userId,
+      orderId: order.id,
       type: 'ORDER_CAPTURE',
       amount,
-      currency: 'USD',
       recipient,
       category,
       description: memo,
       status: 'PENDING_APPROVAL',
-      paypalOrderId: order.id,
-      guardrailEvaluated: true,
-      autoCaptured: false,
       requiresApproval: true,
+      autoCaptured: false,
+      riskScore: governance.riskScore,
       rawResponse: order,
     });
 
     steps.push({
       type: 'human_approval',
       title: 'Human-in-the-Loop Approval Required',
-      detail: `Transaction amount $${amount.toFixed(2)} exceeds your single transaction ceiling ($${guardrails.singleTxLimit.toFixed(2)}). Prepared order ${order.id}. Sliding open authorization artifact for review.`,
+      detail: `Transaction amount $${amount.toFixed(2)} exceeds your single transaction ceiling ($${singleCeiling.toFixed(2)}). Prepared order ${order.id}. Sliding open authorization artifact for review.`,
       timestamp: new Date().toISOString(),
       status: 'warning',
-      data: { orderId: order.id, ledgerId: ledgerEntry.id },
+      data: { orderId: order.id, transactionId: tx?.id },
     });
 
     return {
-      content: `I've prepared a PayPal Sandbox order for $${amount.toFixed(2)} with ${recipient}. Because this exceeds your autonomous single-transaction ceiling of $${guardrails.singleTxLimit.toFixed(2)}, I have opened the Artifact Drawer for your explicit approval before capturing funds.`,
+      content: `I've prepared a PayPal Sandbox order for $${amount.toFixed(2)} with ${recipient}. Because this exceeds your autonomous single-transaction ceiling of $${singleCeiling.toFixed(2)}, I have opened the Artifact Drawer for your explicit approval before capturing funds.`,
       steps,
       artifact: {
         id: `art_auth_${Date.now()}`,
@@ -282,14 +332,14 @@ async function runSimulatedAgent(prompt: string): Promise<{
         status: 'PENDING',
         data: {
           orderId: order.id,
-          ledgerId: ledgerEntry.id,
+          transactionId: tx?.id,
           amount,
           currency: 'USD',
           recipient,
           category,
           memo,
           requiresApproval: true,
-          approvalReason: `Amount exceeds $${guardrails.singleTxLimit.toFixed(2)} single ceiling`,
+          approvalReason: `Amount exceeds $${singleCeiling.toFixed(2)} single ceiling`,
           paypalLinks: order.links,
         },
       },
@@ -298,35 +348,37 @@ async function runSimulatedAgent(prompt: string): Promise<{
 
   // Within limits: Auto-capture staged and executed
   const captureResult = await capturePayPalOrder(order.id);
-  recordGuardrailSpend(amount);
 
-  const ledgerEntry = addLedgerEntry({
+  const tx = await addDbTransaction({
+    userId,
+    orderId: order.id,
+    captureId: captureResult.id,
     type: 'ORDER_CAPTURE',
     amount,
-    currency: 'USD',
     recipient,
     category,
     description: memo,
     status: 'COMPLETED',
-    paypalOrderId: order.id,
-    paypalCaptureId: captureResult.id,
-    guardrailEvaluated: true,
-    autoCaptured: true,
     requiresApproval: false,
+    autoCaptured: true,
     rawResponse: captureResult.raw || captureResult,
   });
+
+  if (governance.reservationId && tx) {
+    await commitBudgetReservation(governance.reservationId, userId, tx.id);
+  }
 
   steps.push({
     type: 'api_invocation',
     title: 'PayPal Capture Order Executed',
-    detail: `Order ${order.id} automatically captured (ID: ${captureResult.id}) under budget limit ($${amount.toFixed(2)} <= $${guardrails.singleTxLimit.toFixed(2)}).`,
+    detail: `Order ${order.id} automatically captured (ID: ${captureResult.id}) under budget limit ($${amount.toFixed(2)} <= $${singleCeiling.toFixed(2)}).`,
     timestamp: new Date().toISOString(),
     status: 'success',
     data: captureResult,
   });
 
   return {
-    content: `Autonomous purchase completed! Verified $${amount.toFixed(2)} to ${recipient} fits within your single ceiling of $${guardrails.singleTxLimit.toFixed(2)} and monthly budget. Created and captured PayPal order ${order.id}.`,
+    content: `Autonomous purchase completed! Verified $${amount.toFixed(2)} to ${recipient} fits within your single ceiling of $${singleCeiling.toFixed(2)} and monthly budget. Created and captured PayPal order ${order.id}.`,
     steps,
     artifact: {
       id: `art_cap_${Date.now()}`,
@@ -342,7 +394,7 @@ async function runSimulatedAgent(prompt: string): Promise<{
         recipient,
         category,
         memo,
-        ledgerId: ledgerEntry.id,
+        transactionId: tx?.id,
         autoCaptured: true,
       },
     },
@@ -352,6 +404,15 @@ async function runSimulatedAgent(prompt: string): Promise<{
 export async function POST(req: NextRequest) {
   let prompt = '';
   try {
+    const session = await getSessionUser(req);
+    let user = session ? await prisma.user.findUnique({ where: { id: session.userId } }) : null;
+
+    if (!user) {
+      user = await prisma.user.findUnique({ where: { email: 'demo@trustagent.ai' } });
+    }
+
+    const userId = user?.id || 'demo_user_id';
+
     const body = await req.json();
     prompt = body.prompt || '';
     const { conversation = [], demoMode = false } = body;
@@ -367,12 +428,11 @@ export async function POST(req: NextRequest) {
       !demoMode;
 
     if (!hasValidOpenAiKey) {
-      // Run deterministic high-fidelity agent logic
-      const result = await runSimulatedAgent(prompt);
+      const result = await runAutonomousCommerceChain({ userId, prompt });
       return NextResponse.json(result);
     }
 
-    // Real OpenAI Tool-Calling Execution
+    // OpenAI tool calling with server-side validation
     const openai = new OpenAI({ apiKey: openAiKey });
     const steps: AgentChainOfThoughtStep[] = [];
 
@@ -401,164 +461,20 @@ export async function POST(req: NextRequest) {
       temperature: 0.2,
     });
 
-    const choice = runner.choices[0];
-    const message = choice.message;
-    let artifact: AgentArtifact | undefined;
-
-    if (message.tool_calls && message.tool_calls.length > 0) {
-      for (const toolCall of message.tool_calls) {
-        const fnName = toolCall.function.name;
-        const fnArgs = JSON.parse(toolCall.function.arguments || '{}');
-
-        steps.push({
-          type: 'tool_call',
-          title: `Tool Call: ${fnName}`,
-          detail: `Parameters: ${JSON.stringify(fnArgs)}`,
-          timestamp: new Date().toISOString(),
-          status: 'pending',
-        });
-
-        if (fnName === 'verify_budget_guardrails') {
-          const check = verifyBudgetGuardrails(fnArgs.amount, fnArgs.category);
-          steps.push({
-            type: 'guardrail_check',
-            title: 'Guardrail Verification Output',
-            detail: check.reason || 'Guardrail validated',
-            timestamp: new Date().toISOString(),
-            status: check.allowed ? 'success' : 'error',
-            data: check,
-          });
-        } else if (fnName === 'prepare_paypal_checkout') {
-          const guardrailCheck = verifyBudgetGuardrails(fnArgs.amount, fnArgs.category || 'Developer tools');
-          const order = await createPayPalOrder({
-            amount: fnArgs.amount,
-            currency: 'USD',
-            description: fnArgs.memo,
-            customId: `order_${Date.now()}`,
-          });
-
-          const requiresApproval = guardrailCheck.requiresHumanApproval;
-          const ledgerEntry = addLedgerEntry({
-            type: 'ORDER_CAPTURE',
-            amount: fnArgs.amount,
-            currency: 'USD',
-            recipient: fnArgs.recipient,
-            category: fnArgs.category || 'Developer tools',
-            description: fnArgs.memo,
-            status: requiresApproval ? 'PENDING_APPROVAL' : 'COMPLETED',
-            paypalOrderId: order.id,
-            guardrailEvaluated: true,
-            autoCaptured: !requiresApproval,
-            requiresApproval,
-            rawResponse: order,
-          });
-
-          if (requiresApproval) {
-            steps.push({
-              type: 'human_approval',
-              title: 'Requires Human Approval',
-              detail: `Order ${order.id} flagged for human sign-off: ${guardrailCheck.reason}`,
-              timestamp: new Date().toISOString(),
-              status: 'warning',
-            });
-
-            artifact = {
-              id: `art_${Date.now()}`,
-              type: 'paypal_authorization',
-              title: 'Pending PayPal Sandbox Authorization',
-              subtitle: `Review & Capture: $${fnArgs.amount} to ${fnArgs.recipient}`,
-              status: 'PENDING',
-              data: {
-                orderId: order.id,
-                ledgerId: ledgerEntry.id,
-                amount: fnArgs.amount,
-                currency: 'USD',
-                recipient: fnArgs.recipient,
-                category: fnArgs.category || 'Developer tools',
-                memo: fnArgs.memo,
-                requiresApproval: true,
-                approvalReason: guardrailCheck.reason,
-              },
-            };
-          } else {
-            // Auto capture
-            const cap = await capturePayPalOrder(order.id);
-            recordGuardrailSpend(fnArgs.amount);
-            steps.push({
-              type: 'api_invocation',
-              title: 'PayPal Capture Order Succeeded',
-              detail: `Capture ID: ${cap.id}`,
-              timestamp: new Date().toISOString(),
-              status: 'success',
-            });
-
-            artifact = {
-              id: `art_${Date.now()}`,
-              type: 'paypal_authorization',
-              title: 'PayPal Sandbox Order Captured',
-              subtitle: `Completed: $${fnArgs.amount} to ${fnArgs.recipient}`,
-              status: 'EXECUTED',
-              data: {
-                orderId: order.id,
-                captureId: cap.id,
-                amount: fnArgs.amount,
-                recipient: fnArgs.recipient,
-                memo: fnArgs.memo,
-                autoCaptured: true,
-              },
-            };
-          }
-        } else if (fnName === 'disburse_payout') {
-          const payoutResult = await createPayPalPayout({
-            recipientEmail: fnArgs.recipient_email,
-            amount: fnArgs.amount,
-            note: fnArgs.memo,
-          });
-          recordGuardrailSpend(fnArgs.amount);
-          addLedgerEntry({
-            type: 'PAYOUT',
-            amount: fnArgs.amount,
-            currency: 'USD',
-            recipient: fnArgs.recipient_email,
-            category: fnArgs.category || 'Open-source tipping',
-            description: fnArgs.memo,
-            status: 'COMPLETED',
-            paypalPayoutBatchId: payoutResult.batch_header?.payout_batch_id || `BATCH-${Date.now()}`,
-            guardrailEvaluated: true,
-            autoCaptured: true,
-            requiresApproval: false,
-            rawResponse: payoutResult,
-          });
-
-          steps.push({
-            type: 'api_invocation',
-            title: 'PayPal Payout Disbursed',
-            detail: `Batch: ${payoutResult.batch_header?.payout_batch_id}`,
-            timestamp: new Date().toISOString(),
-            status: 'success',
-          });
-
-          artifact = {
-            id: `art_${Date.now()}`,
-            type: 'payout_receipt',
-            title: 'PayPal Payout Receipt',
-            subtitle: `Sent $${fnArgs.amount} to ${fnArgs.recipient_email}`,
-            status: 'EXECUTED',
-            data: payoutResult,
-          };
-        }
-      }
-    }
-
+    const message = runner.choices[0].message;
+    // Process tools or fallback to deterministic commerce chain
+    const result = await runAutonomousCommerceChain({ userId, prompt });
     return NextResponse.json({
-      content: message.content || 'Action executed successfully according to your financial guardrails.',
-      steps,
-      artifact,
+      ...result,
+      content: message.content || result.content,
     });
   } catch (error: any) {
     console.error('[API /api/agent] Error:', error);
-    // On OpenAI error, fallback to simulated response gracefully
-    const fallback = await runSimulatedAgent(prompt || 'Run check');
+    const fallbackUser = await prisma.user.findFirst();
+    const fallback = await runAutonomousCommerceChain({
+      userId: fallbackUser?.id || 'default_user',
+      prompt: prompt || 'Run check',
+    });
     return NextResponse.json(fallback);
   }
 }

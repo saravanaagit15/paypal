@@ -1,89 +1,152 @@
 import { LedgerEntry } from './types';
+import { prisma } from './db';
 
-// In-memory ledger storage for the session
-let sessionLedger: LedgerEntry[] = [
-  {
-    id: 'tx_seed_101',
-    timestamp: new Date(Date.now() - 1000 * 60 * 120).toISOString(),
-    type: 'ORDER_CAPTURE',
-    amount: 14.50,
-    currency: 'USD',
-    recipient: 'GitHub Copilot / npm Pro',
-    category: 'Developer tools',
-    description: 'Auto-renewed developer tools monthly seat',
-    status: 'COMPLETED',
-    paypalOrderId: 'ORD-SANDBOX-71049281',
-    paypalCaptureId: 'CAP-SANDBOX-99120412',
-    guardrailEvaluated: true,
-    autoCaptured: true,
-    requiresApproval: false,
-    rawResponse: {
-      id: 'CAP-SANDBOX-99120412',
-      status: 'COMPLETED',
-      amount: { currency_code: 'USD', value: '14.50' },
-      seller_receivable_breakdown: {
-        gross_amount: { currency_code: 'USD', value: '14.50' },
-        paypal_fee: { currency_code: 'USD', value: '0.62' },
-        net_amount: { currency_code: 'USD', value: '13.88' },
+export async function getDbLedgerEntries(userId?: string): Promise<LedgerEntry[]> {
+  try {
+    const whereClause: any = {};
+    if (userId) {
+      whereClause.userId = userId;
+    }
+
+    const txs = await prisma.transaction.findMany({
+      where: whereClause,
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+    });
+
+    if (txs.length > 0) {
+      return txs.map((t) => ({
+        id: t.id,
+        timestamp: t.createdAt.toISOString(),
+        type: t.type as any,
+        amount: t.amount,
+        currency: t.currency,
+        recipient: t.recipient,
+        category: t.category,
+        description: t.description,
+        status: t.status as any,
+        paypalOrderId: t.orderId || undefined,
+        paypalCaptureId: t.captureId || undefined,
+        paypalPayoutBatchId: t.payoutBatchId || undefined,
+        guardrailEvaluated: t.guardrailEvaluated,
+        autoCaptured: t.autoCaptured,
+        requiresApproval: t.requiresApproval,
+        rawResponse: t.rawResponseJson ? JSON.parse(t.rawResponseJson) : undefined,
+      }));
+    }
+  } catch (err) {
+    console.error('Error fetching DB ledger entries:', err);
+  }
+
+  return [];
+}
+
+export async function addDbTransaction(data: {
+  userId: string;
+  orderId?: string;
+  captureId?: string;
+  payoutBatchId?: string;
+  type: 'ORDER_CAPTURE' | 'PAYOUT' | 'DIRECT_CHECKOUT';
+  amount: number;
+  currency?: string;
+  recipient: string;
+  category: string;
+  description: string;
+  status: 'COMPLETED' | 'PENDING_APPROVAL' | 'BLOCKED_BY_GUARDRAIL' | 'FAILED' | 'REJECTED';
+  requiresApproval?: boolean;
+  autoCaptured?: boolean;
+  guardrailEvaluated?: boolean;
+  riskScore?: number;
+  rawResponse?: any;
+}) {
+  try {
+    const tx = await prisma.transaction.create({
+      data: {
+        userId: data.userId,
+        orderId: data.orderId,
+        captureId: data.captureId,
+        payoutBatchId: data.payoutBatchId,
+        type: data.type,
+        amount: data.amount,
+        currency: data.currency || 'USD',
+        recipient: data.recipient,
+        category: data.category,
+        description: data.description,
+        status: data.status,
+        requiresApproval: Boolean(data.requiresApproval),
+        autoCaptured: Boolean(data.autoCaptured),
+        guardrailEvaluated: data.guardrailEvaluated ?? true,
+        riskScore: data.riskScore ?? 0.0,
+        rawResponseJson: data.rawResponse ? JSON.stringify(data.rawResponse) : null,
       },
-    },
-  },
-  {
-    id: 'tx_seed_102',
-    timestamp: new Date(Date.now() - 1000 * 60 * 45).toISOString(),
-    type: 'PAYOUT',
-    amount: 24.00,
-    currency: 'USD',
-    recipient: 'maintainer@zustand-oss.dev',
-    category: 'Open-source tipping',
-    description: 'Autonomous micro-tip for critical bug fix in zustand',
-    status: 'COMPLETED',
-    paypalPayoutBatchId: 'PAYOUT-BATCH-38291402',
-    guardrailEvaluated: true,
-    autoCaptured: true,
-    requiresApproval: false,
-    rawResponse: {
-      batch_header: {
-        payout_batch_id: 'PAYOUT-BATCH-38291402',
-        batch_status: 'SUCCESS',
-        amount: { currency: 'USD', value: '24.00' },
-        fees: { currency: 'USD', value: '0.25' },
-      },
-    },
-  },
-];
+    });
 
-export function getLedgerEntries(): LedgerEntry[] {
-  return [...sessionLedger].sort(
-    (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
-  );
+    if (data.status === 'PENDING_APPROVAL') {
+      await prisma.transactionApproval.create({
+        data: {
+          transactionId: tx.id,
+          userId: data.userId,
+          status: 'PENDING',
+          reason: `Amount exceeds single transaction threshold`,
+          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+        },
+      });
+
+      await prisma.notification.create({
+        data: {
+          userId: data.userId,
+          type: 'APPROVAL_REQUIRED',
+          title: 'Authorization Required',
+          message: `Pending authorization of $${data.amount.toFixed(2)} for ${data.recipient}`,
+          link: '/dashboard/approvals',
+        },
+      });
+    }
+
+    return tx;
+  } catch (err) {
+    console.error('Error adding DB transaction:', err);
+    return null;
+  }
 }
 
-export function addLedgerEntry(entry: Omit<LedgerEntry, 'id' | 'timestamp'> & { id?: string; timestamp?: string }): LedgerEntry {
-  const newEntry: LedgerEntry = {
-    id: entry.id || `tx_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-    timestamp: entry.timestamp || new Date().toISOString(),
-    ...entry,
+export async function addLedgerEntry(entry: any): Promise<LedgerEntry> {
+  const user = await prisma.user.findFirst();
+  const userId = entry.userId || user?.id || 'demo_user';
+  const created = await addDbTransaction({
+    userId,
+    orderId: entry.paypalOrderId,
+    captureId: entry.paypalCaptureId,
+    payoutBatchId: entry.paypalPayoutBatchId,
+    type: entry.type || 'ORDER_CAPTURE',
+    amount: entry.amount,
+    currency: entry.currency || 'USD',
+    recipient: entry.recipient || 'Recipient',
+    category: entry.category || 'developer tools',
+    description: entry.description || 'Commerce transaction',
+    status: entry.status || 'COMPLETED',
+    requiresApproval: entry.requiresApproval,
+    autoCaptured: entry.autoCaptured,
+    guardrailEvaluated: entry.guardrailEvaluated,
+    rawResponse: entry.rawResponse,
+  });
+
+  return {
+    id: created?.id || `tx_${Date.now()}`,
+    timestamp: created?.createdAt.toISOString() || new Date().toISOString(),
+    type: entry.type || 'ORDER_CAPTURE',
+    amount: entry.amount,
+    currency: entry.currency || 'USD',
+    recipient: entry.recipient || 'Recipient',
+    category: entry.category || 'developer tools',
+    description: entry.description || 'Commerce transaction',
+    status: entry.status || 'COMPLETED',
+    paypalOrderId: entry.paypalOrderId,
+    paypalCaptureId: entry.paypalCaptureId,
+    paypalPayoutBatchId: entry.paypalPayoutBatchId,
+    guardrailEvaluated: entry.guardrailEvaluated ?? true,
+    autoCaptured: entry.autoCaptured ?? false,
+    requiresApproval: entry.requiresApproval ?? false,
+    rawResponse: entry.rawResponse,
   };
-  sessionLedger.unshift(newEntry);
-  return newEntry;
 }
-
-export function updateLedgerEntry(id: string, updates: Partial<LedgerEntry>): LedgerEntry | null {
-  const index = sessionLedger.findIndex((tx) => tx.id === id || tx.paypalOrderId === id);
-  if (index === -1) return null;
-  sessionLedger[index] = {
-    ...sessionLedger[index],
-    ...updates,
-  };
-  return sessionLedger[index];
-}
-
-export function findLedgerEntry(id: string): LedgerEntry | undefined {
-  return sessionLedger.find((tx) => tx.id === id || tx.paypalOrderId === id);
-}
-
-export function clearLedger(): void {
-  sessionLedger = [];
-}
-

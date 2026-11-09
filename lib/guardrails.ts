@@ -1,10 +1,11 @@
 import { GuardrailConfig, GuardrailCheckResult } from './types';
+import { prisma } from './db';
 
-// Global guardrail in-memory state
+// Fallback in-memory state for unauthenticated demo mode
 let currentGuardrails: GuardrailConfig = {
   singleTxLimit: 25.00,
   monthlyLimit: 200.00,
-  currentMonthlySpent: 38.50, // Starting simulated spend for realistic demo
+  currentMonthlySpent: 38.50,
   whitelistedCategories: [
     'developer tools',
     'github dependencies',
@@ -15,6 +16,37 @@ let currentGuardrails: GuardrailConfig = {
     'saas subscription',
   ],
 };
+
+export async function getUserGuardrails(userId?: string): Promise<GuardrailConfig> {
+  if (!userId) return { ...currentGuardrails };
+
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      include: { budget: true, spendingPolicy: true },
+    });
+
+    if (user?.budget) {
+      let whitelistedCategories: string[] = currentGuardrails.whitelistedCategories;
+      try {
+        if (user.spendingPolicy?.whitelistedCategoriesJson) {
+          whitelistedCategories = JSON.parse(user.spendingPolicy.whitelistedCategoriesJson);
+        }
+      } catch {}
+
+      return {
+        singleTxLimit: user.spendingPolicy?.requireApprovalAbove || user.budget.singleTxLimit,
+        monthlyLimit: user.budget.monthlyLimit,
+        currentMonthlySpent: user.budget.currentMonthlySpent,
+        whitelistedCategories,
+      };
+    }
+  } catch (err) {
+    console.error('Error fetching user guardrails from DB:', err);
+  }
+
+  return { ...currentGuardrails };
+}
 
 export function getGuardrailConfig(): GuardrailConfig {
   return { ...currentGuardrails };
@@ -37,10 +69,6 @@ export function recordGuardrailSpend(amount: number): void {
   );
 }
 
-export function resetGuardrailSpend(): void {
-  currentGuardrails.currentMonthlySpent = 0;
-}
-
 export function verifyBudgetGuardrails(amount: number, category: string): GuardrailCheckResult {
   const normCategory = (category || '').toLowerCase().trim();
   const remainingMonthly = Number(
@@ -48,7 +76,6 @@ export function verifyBudgetGuardrails(amount: number, category: string): Guardr
   );
   const violations: string[] = [];
 
-  // Check category whitelist
   const isWhitelisted = currentGuardrails.whitelistedCategories.some((whitelisted) =>
     normCategory.includes(whitelisted) || whitelisted.includes(normCategory)
   );
@@ -59,14 +86,12 @@ export function verifyBudgetGuardrails(amount: number, category: string): Guardr
     );
   }
 
-  // Check monthly limit
   if (amount > remainingMonthly) {
     violations.push(
       `Requested amount ($${amount.toFixed(2)}) exceeds remaining monthly ceiling ($${remainingMonthly.toFixed(2)})`
     );
   }
 
-  // Check single transaction limit
   const exceedsSingleLimit = amount > currentGuardrails.singleTxLimit;
   if (exceedsSingleLimit) {
     violations.push(
@@ -74,7 +99,6 @@ export function verifyBudgetGuardrails(amount: number, category: string): Guardr
     );
   }
 
-  // If non-whitelisted or completely exceeding monthly budget, block or require approval
   if (!isWhitelisted && normCategory.length > 0) {
     return {
       allowed: false,
@@ -112,4 +136,3 @@ export function verifyBudgetGuardrails(amount: number, category: string): Guardr
     remainingMonthlyBudget: remainingMonthly,
   };
 }
-

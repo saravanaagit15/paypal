@@ -47,7 +47,7 @@ export interface PayPalPayoutParams {
 }
 
 export type LedgerTransactionType = 'ORDER_CAPTURE' | 'PAYOUT' | 'DIRECT_CHECKOUT';
-export type LedgerStatus = 'COMPLETED' | 'PENDING_APPROVAL' | 'BLOCKED_BY_GUARDRAIL' | 'FAILED';
+export type LedgerStatus = 'COMPLETED' | 'PENDING_APPROVAL' | 'BLOCKED_BY_GUARDRAIL' | 'FAILED' | 'REJECTED';
 
 export interface LedgerEntry {
   id: string;
