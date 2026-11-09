@@ -254,3 +254,4 @@ export default function MerchantsPage() {
     </div>
   );
 }
+

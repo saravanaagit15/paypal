@@ -68,3 +68,4 @@ export async function getSessionUser(req?: NextRequest): Promise<SessionPayload 
   if (!token) return null;
   return verifyToken(token);
 }
+
